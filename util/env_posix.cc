@@ -282,11 +282,12 @@ class PosixMmapFile : public WritableFile {
  public:
   PosixMmapFile(const std::string& fname, int fd,
                 size_t page_size, size_t file_offset=0L,
-                bool is_async=false)
+                bool is_async=false,
+                size_t map_size=gMapSize)
       : filename_(fname),
         fd_(fd),
         page_size_(page_size),
-        map_size_(Roundup(gMapSize, page_size)),
+        map_size_(Roundup(map_size, page_size)),
         base_(NULL),
         limit_(NULL),
         dst_(NULL),
@@ -345,6 +346,8 @@ class PosixMmapFile : public WritableFile {
   virtual Status Close() {
     Status s;
     size_t file_length;
+    int ret_val;
+
 
     // compute actual file length before final unmap
     file_length=file_offset_ + (dst_ - base_);
@@ -356,11 +359,12 @@ class PosixMmapFile : public WritableFile {
     // hard code
     if (!is_async_)
     {
-        int ret_val;
-
         ret_val=ftruncate(fd_, file_length);
         if (0!=ret_val)
+        {
             syslog(LOG_ERR,"Close ftruncate failed [%d, %m]", errno);
+            s = IOError(filename_, errno);
+        }   // if
 
         ret_val=close(fd_);
     }  // if
@@ -369,7 +373,23 @@ class PosixMmapFile : public WritableFile {
     else
     {
         *(ref_count_ +1)=file_length;
-        ReleaseRef(ref_count_, fd_);
+        ret_val=ReleaseRef(ref_count_, fd_);
+
+        // retry once if failed
+        if (0!=ret_val)
+        {
+            Env::Default()->SleepForMicroseconds(500000);
+            ret_val=ReleaseRef(ref_count_, fd_);
+            if (0!=ret_val)
+            {
+                syslog(LOG_ERR,"ReleaseRef failed in Close");
+                s = IOError(filename_, errno);
+                delete [] ref_count_;
+
+                // force close
+                ret_val=close(fd_);
+            }   // if
+        }   // if
     }   // else
 
     fd_ = -1;
@@ -419,8 +439,11 @@ class PosixMmapFile : public WritableFile {
 
   // if std::shared_ptr was guaranteed thread safe everywhere
   //  the following function would be best written differently
-  static void ReleaseRef(volatile uint64_t * Count, int File)
+  static int ReleaseRef(volatile uint64_t * Count, int File)
   {
+      bool good;
+
+      good=true;
       if (NULL!=Count)
       {
           int ret_val;
@@ -430,14 +453,38 @@ class PosixMmapFile : public WritableFile {
           {
               ret_val=ftruncate(File, *(Count +1));
               if (0!=ret_val)
+              {
                   syslog(LOG_ERR,"ReleaseRef ftruncate failed [%d, %m]", errno);
+                  gPerfCounters->Inc(ePerfBGWriteError);
+                  good=false;
+              }   // if
 
-              ret_val=close(File);
-              gPerfCounters->Inc(ePerfRWFileClose);
+              if (good)
+              {
+                  ret_val=close(File);
+                  if (0==ret_val)
+                  {
+                      gPerfCounters->Inc(ePerfRWFileClose);
+                  }   // if
+                  else
+                  {
+                      syslog(LOG_ERR,"ReleaseRef close failed [%d, %m]", errno);
+                      gPerfCounters->Inc(ePerfBGWriteError);
+                      good=false;
+                  }   // else
 
-              delete [] Count;
+              }   // if
+
+              if (good)
+                  delete [] Count;
+              else
+                  inc_and_fetch(Count); // try again.
+
           }   // if
       }   // if
+
+      return(good ? 0 : -1);
+
   }   // static ReleaseRef
 
 };
@@ -546,20 +593,22 @@ class PosixEnv : public Env {
   }
 
   virtual Status NewWritableFile(const std::string& fname,
-                                 WritableFile** result) {
+                                 WritableFile** result,
+                                 size_t map_size) {
     Status s;
     const int fd = open(fname.c_str(), O_CREAT | O_RDWR | O_TRUNC, 0644);
     if (fd < 0) {
       *result = NULL;
       s = IOError(fname, errno);
     } else {
-      *result = new PosixMmapFile(fname, fd, page_size_, 0, false);
+      *result = new PosixMmapFile(fname, fd, page_size_, 0, false, map_size);
     }
     return s;
   }
 
   virtual Status NewAppendableFile(const std::string& fname,
-                                   WritableFile** result) {
+                                   WritableFile** result,
+                                   size_t map_size) {
     Status s;
     const int fd = open(fname.c_str(), O_CREAT | O_RDWR, 0644);
     if (fd < 0) {
@@ -571,7 +620,7 @@ class PosixEnv : public Env {
       s = GetFileSize(fname, &size);
       if (s.ok())
       {
-          *result = new PosixMmapFile(fname, fd, page_size_, size);
+          *result = new PosixMmapFile(fname, fd, page_size_, size, false, map_size);
       }   // if
       else
       {
@@ -583,14 +632,15 @@ class PosixEnv : public Env {
   }
 
   virtual Status NewWriteOnlyFile(const std::string& fname,
-                                 WritableFile** result) {
+                                  WritableFile** result,
+                                  size_t map_size) {
     Status s;
     const int fd = open(fname.c_str(), O_CREAT | O_RDWR | O_TRUNC, 0644);
     if (fd < 0) {
       *result = NULL;
       s = IOError(fname, errno);
     } else {
-      *result = new PosixMmapFile(fname, fd, page_size_, 0, true);
+      *result = new PosixMmapFile(fname, fd, page_size_, 0, true, map_size);
     }
     return s;
   }
@@ -771,9 +821,24 @@ class PosixEnv : public Env {
   }  // SleepForMicroSeconds
 
 
-  virtual int GetBackgroundBacklog() const
-    {return(gImmThreads->m_WorkQueueAtomic + gWriteThreads->m_WorkQueueAtomic
-          + gLevel0Threads->m_WorkQueueAtomic + gCompactionThreads->m_WorkQueueAtomic);};
+  virtual size_t RecoveryMmapSize(const struct Options * options) const
+    {
+      size_t map_size;
+
+      if (NULL!=options)
+      {
+        // large buffers, try for a little bit bigger than half hoping
+        //  for two writes ... not three
+        if (10*1024*1024 < options->write_buffer_size)
+            map_size=(options->write_buffer_size/6)*4;
+        else
+            map_size=(options->write_buffer_size*12)/10;  // integer multiply 1.2
+      } // if
+      else
+        map_size=2*1024*1024L;
+
+      return(map_size);
+    };
 
  private:
 
@@ -784,13 +849,6 @@ class PosixEnv : public Env {
     }
   }
 
-  // BGThread() is the body of the background thread
-  void BGThread();
-  static void* BGThreadWrapper(void* arg) {
-    reinterpret_cast<PosixEnv*>(arg)->BGThread();
-    return NULL;
-  }
-
   size_t page_size_;
   pthread_mutex_t mu_;
   pthread_cond_t bgsignal_;
@@ -799,18 +857,15 @@ class PosixEnv : public Env {
   // Entry per Schedule() call
   struct BGItem { void* arg; void (*function)(void*); int priority;};
 
-  volatile uint64_t write_rate_usec_; // recently experienced average time to
-                                      // write one key during background compaction
-
 };
 
 
 PosixEnv::PosixEnv() : page_size_(getpagesize()),
-                       clock_res_(1), write_rate_usec_(0)
+                       clock_res_(1)
 {
-  struct timespec ts;
 
 #if _POSIX_TIMERS >= 200801L
+  struct timespec ts;
   clock_getres(CLOCK_MONOTONIC, &ts);
   clock_res_=ts.tv_sec*1000000+ts.tv_nsec/1000;
   if (0==clock_res_)
@@ -859,12 +914,19 @@ pthread_t PosixEnv::StartThread(void (*function)(void* arg), void* arg) {
 }
 
 
-// this was a new file:  unmap, hold in page cache
-void BGFileUnmapper2(void * arg)
+// Called by BGFileUnmapper which manages retries
+//    this was a new file:  unmap, hold in page cache
+int
+BGFileUnmapper(void * arg)
 {
     BGCloseInfo * file_ptr;
     bool err_flag;
     int ret_val;
+
+    //
+    // Reminder:  this could get called multiple times for
+    //            same "arg" due to error retry
+    //
 
     err_flag=false;
     file_ptr=(BGCloseInfo *)arg;
@@ -874,12 +936,19 @@ void BGFileUnmapper2(void * arg)
     if (NULL!=file_ptr->ref_count_)
         gPerfCounters->Inc(ePerfBGCloseUnmap);
 
-    ret_val=munmap(file_ptr->base_, file_ptr->length_);
-    if (0!=ret_val)
+    if (NULL!=file_ptr->base_)
     {
-      syslog(LOG_ERR,"BGFileUnmapper2 munmap failed [%d, %m]", errno);
-      err_flag=true;
-    }  // if
+        ret_val=munmap(file_ptr->base_, file_ptr->length_);
+        if (0==ret_val)
+        {
+            file_ptr->base_=NULL;
+        }   // if
+        else
+        {
+            syslog(LOG_ERR,"BGFileUnmapper2 munmap failed [%d, %m]", errno);
+            err_flag=true;
+        }  // else
+    }   // if
 
 #if defined(HAVE_FADVISE)
     if (0==file_ptr->metadata_
@@ -911,20 +980,60 @@ void BGFileUnmapper2(void * arg)
     }   // else
 #endif
 
-    PosixMmapFile::ReleaseRef(file_ptr->ref_count_, file_ptr->fd_);
-
-    gPerfCounters->Inc(ePerfRWFileUnmap);
+    // release access to file, maybe close it
+    if (!err_flag)
+    {
+        ret_val=PosixMmapFile::ReleaseRef(file_ptr->ref_count_, file_ptr->fd_);
+        err_flag=(0!=ret_val);
+    }   // if
 
     if (err_flag)
         gPerfCounters->Inc(ePerfBGWriteError);
 
     // routine called directly or via async thread, this
     //  controls when to delete file_ptr object
-    file_ptr->RefDec();
+    if (!err_flag)
+    {
+        gPerfCounters->Inc(ePerfRWFileUnmap);
+        file_ptr->RefDec();
+    }   // if
+
+    return(err_flag ? -1 : 0);
+
+}   // BGFileUnmapper
+
+
+// Thread entry point, and retry loop
+void BGFileUnmapper2(void * arg)
+{
+    int retries, ret_val;
+
+    retries=0;
+    ret_val=0;
+
+    do
+    {
+        if (1<retries)
+            Env::Default()->SleepForMicroseconds(100000);
+
+        ret_val=BGFileUnmapper(arg);
+        ++retries;
+    } while(retries<3 && 0!=ret_val);
+
+    // release object's memory here
+    if (0!=ret_val)
+    {
+        BGCloseInfo * file_ptr;
+
+        file_ptr=(BGCloseInfo *)arg;
+        file_ptr->RefDec();
+    }   // if
 
     return;
 
 }   // BGFileUnmapper2
+
+
 
 }  // namespace
 
@@ -965,9 +1074,11 @@ static void InitDefaultEnv()
     gLevel0Threads=new HotThreadPool(3, "Level0Compact",
                                      ePerfBGLevel0Direct, ePerfBGLevel0Queued,
                                      ePerfBGLevel0Dequeued, ePerfBGLevel0Weighted);
-    gCompactionThreads=new HotThreadPool(5, "GeneralCompact",
+    // "2" is for Linux OS "nice", assumption is "1" nice might be
+    //   used by AAE hash trees in the future
+    gCompactionThreads=new HotThreadPool(3, "GeneralCompact",
                                          ePerfBGCompactDirect, ePerfBGCompactQueued,
-                                         ePerfBGCompactDequeued, ePerfBGCompactWeighted);
+                                         ePerfBGCompactDequeued, ePerfBGCompactWeighted, 2);
 
     started=true;
 }
@@ -982,13 +1093,10 @@ void Env::Shutdown()
 {
     if (started)
     {
-        delete default_env;
-        default_env=NULL;
-
-        ThrottleShutdown();
+        // prevent throttle from initiating new compactions
+        ThrottleStopThreads();
     }   // if
 
-    ComparatorShutdown();
     DBListShutdown();
 
     delete gImmThreads;
@@ -1002,6 +1110,24 @@ void Env::Shutdown()
 
     delete gCompactionThreads;
     gCompactionThreads=NULL;
+
+    if (started)
+    {
+        // release throttle globals now that
+        //  background compaction threads done
+        ThrottleClose();
+
+        delete default_env;
+        default_env=NULL;
+    }   // if
+
+    ExpiryModule::ShutdownExpiryModule();
+
+    // wait until compaction threads complete before
+    //  releasing comparator object (else segfault possible)
+    ComparatorShutdown();
+
+    PerformanceCounters::Close(gPerfCounters);
 
 }   // Env::Shutdown
 

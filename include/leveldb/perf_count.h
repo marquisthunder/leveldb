@@ -2,7 +2,7 @@
 //
 // perf_count.h:  performance counters LevelDB
 //
-// Copyright (c) 2012-2013 Basho Technologies, Inc. All Rights Reserved.
+// Copyright (c) 2012-2016 Basho Technologies, Inc. All Rights Reserved.
 //
 // This file is provided to you under the Apache License,
 // Version 2.0 (the "License"); you may not use this file
@@ -49,6 +49,10 @@ enum SstCountEnum
     eSstCountDeleteKey=12,     //!< tombstone count
     eSstCountBlockSizeUsed=13, //!< Options::block_size used with this file
     eSstCountUserDataSize=14,  //!< post-compression size of non-metadata (user keys/values/block overhead)
+    eSstCountExpiry1=15,       //!< undocumented expiry counter 1
+    eSstCountExpiry2=16,       //!< undocumented expiry counter 2
+    eSstCountExpiry3=17,       //!< undocumented expiry counter 3
+    eSstCountSequence=18,      //!< highest sequence number in file
 
     // must follow last index name to represent size of array
     eSstCountEnumSize,          //!< size of the array described by the enum values
@@ -225,6 +229,25 @@ enum PerformanceCountersEnum
 
     ePerfApiDelete=89,        //!< Count of DB::Delete
 
+    ePerfBGMove=90,           //!< compaction was a successful move
+    ePerfBGMoveFail=91,       //!< compaction move failed, regular compaction attempted
+
+    ePerfThrottleUnadjusted=92,//!< current unadjusted throttle gauge
+
+    // this one was added to the other ePerfElevelXxx counters above when we backported HotThreadPool to eleveldb
+    ePerfElevelWeighted=93,   //!< total microseconds item spent on queue
+
+    ePerfExpiredKeys=94,      //!< key physically removed because it expired
+    ePerfExpiredFiles=95,     //!< entire file removed because all keys expired
+
+    ePerfSyslogWrite=96,      //!< logged message to syslog
+    ePerfBackupStarted=97,    //!< hot backup initiated
+    ePerfBackupError=98,      //!< hot backup had an error
+
+    ePerfPropCacheHit=99,     //!< property cache had data
+    ePerfPropCacheMiss=100,   //!< property cache had to look up data
+    ePerfPropCacheError=101,  //!< no property cache entry built/located
+
     // must follow last index name to represent size of array
     //  (ASSUMES previous enum is highest value)
     ePerfCountEnumSize,     //!< size of the array described by the enum values
@@ -232,6 +255,14 @@ enum PerformanceCountersEnum
     ePerfVersion=1,         //!< structure versioning
     ePerfKey=41207          //!< random number as shared memory identifier
 };
+
+
+struct PerfCounterAttributes
+{
+    const char * m_PerfCounterName;  //!< text description
+    const bool m_PerfDiscretionary;  //!< true if ok to disable
+};  // PerfCounterAttributes
+
 
 //
 // Do NOT use virtual functions.  This structure will be aligned at different
@@ -248,7 +279,7 @@ protected:
 
     volatile uint64_t m_Counter[ePerfCountEnumSize];
 
-    static const char * m_PerfCounterNames[];
+    static const PerfCounterAttributes m_PerfCounterAttr[];
     static int m_PerfSharedId;
     static volatile uint64_t m_BogusCounter;  //!< for out of range GetPtr calls
 
@@ -290,6 +321,8 @@ public:
 };  // struct PerformanceCounters
 
 extern PerformanceCounters * gPerfCounters;
+
+extern volatile bool gPerfCountersDisabled;
 
 }  // namespace leveldb
 

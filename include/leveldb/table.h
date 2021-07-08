@@ -41,7 +41,7 @@ class Table {
                      uint64_t file_size,
                      Table** table);
 
-  ~Table();
+  virtual ~Table();
 
   // Returns a new iterator over the table contents.
   // The result of NewIterator() is initially invalid (caller must
@@ -64,7 +64,12 @@ class Table {
   size_t TableObjectSize();
 
   // riak routine to retrieve disk size of table file
-  uint64_t GetFileSize();
+  //  ("virtual" is for unit test activites)
+  virtual uint64_t GetFileSize();
+
+  // Riak routine to request bloom filter load on
+  //  second read operation (not iterator read)
+  bool ReadFilter();
 
   // access routines for testing tools, not for public use
   Block * TEST_GetIndexBlock();
@@ -73,7 +78,7 @@ class Table {
   static Iterator* TEST_BlockReader(void* Ptr, const ReadOptions& ROptions, const Slice& SliceReturn)
     {return(BlockReader(Ptr, ROptions, SliceReturn));};
 
- private:
+ protected:  // was private, made protected for unit tests
   struct Rep;
   Rep* rep_;
 
@@ -91,7 +96,7 @@ class Table {
 
 
   void ReadMeta(const Footer& footer);
-  void ReadFilter(const Slice& filter_handle_value, const class FilterPolicy * policy);
+  void ReadFilter(class BlockHandle & filter_handle_value, const class FilterPolicy * policy);
   void ReadSstCounters(const Slice& sst_counters_handle_value);
 
   // No copying allowed

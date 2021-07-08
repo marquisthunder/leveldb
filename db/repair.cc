@@ -54,8 +54,6 @@ class Repairer {
         icmp_(options.comparator),
         ipolicy_(options.filter_policy),
         owns_info_log_(options_.info_log != options.info_log),
-        owns_cache_(options_.block_cache != options.block_cache),
-        has_level_dirs_(false),
         db_lock_(NULL),
         next_file_number_(1)
   {
@@ -170,8 +168,6 @@ class Repairer {
   InternalKeyComparator const icmp_;
   InternalFilterPolicy const ipolicy_;
   bool owns_info_log_;
-  bool owns_cache_;
-  bool has_level_dirs_;
   FileLock* db_lock_;
   TableCache* table_cache_;
   VersionEdit edit_;
@@ -302,7 +298,7 @@ class Repairer {
         continue;
       }
       WriteBatchInternal::SetContents(&batch, record);
-      status = WriteBatchInternal::InsertInto(&batch, mem);
+      status = WriteBatchInternal::InsertInto(&batch, mem, &options_);
       if (status.ok()) {
         counter += WriteBatchInternal::Count(&batch);
       } else {
@@ -338,7 +334,6 @@ class Repairer {
   }
 
   void ExtractMetaData() {
-    std::vector<TableInfo> kept;
     for (int level=0; level < config::kNumLevels; ++level)
     {
       std::vector<uint64_t> * number_ptr;
@@ -365,12 +360,14 @@ class Repairer {
   }
 
   Status ScanTable(TableInfo* t) {
+    Table * table_ptr;
+    SstCounters counters;
     std::string fname = TableFileName(options_, t->meta.number, t->meta.level);
     int counter = 0;
     Status status = env_->GetFileSize(fname, &t->meta.file_size);
     if (status.ok()) {
       Iterator* iter = table_cache_->NewIterator(
-          ReadOptions(), t->meta.number, t->meta.file_size, t->meta.level);
+          ReadOptions(), t->meta.number, t->meta.file_size, t->meta.level, &table_ptr);
       bool empty = true;
       ParsedInternalKey parsed;
       t->max_sequence = 0;
@@ -396,6 +393,12 @@ class Repairer {
       if (!iter->status().ok()) {
         status = iter->status();
       }
+      else {
+        counters=table_ptr->GetSstCounters();
+        t->meta.exp_write_low=counters.Value(eSstCountExpiry1);
+        t->meta.exp_write_high=counters.Value(eSstCountExpiry2);
+        t->meta.exp_explicit_high=counters.Value(eSstCountExpiry3);
+      }
       delete iter;
     }
     Log(options_.info_log, "Table #%llu: %d entries %s",
@@ -408,7 +411,7 @@ class Repairer {
   Status WriteDescriptor() {
     std::string tmp = TempFileName(dbname_, 1);
     WritableFile* file;
-    Status status = env_->NewWritableFile(tmp, &file);
+    Status status = env_->NewWritableFile(tmp, &file, 4096);
     if (!status.ok()) {
       return status;
     }
@@ -441,8 +444,9 @@ class Repairer {
       table_ptr=&tables_[level];
 
       for ( i = table_ptr->begin(); table_ptr->end()!= i; i++) {
-          edit_.AddFile(level, i->meta.number, i->meta.file_size,
-                    i->meta.smallest, i->meta.largest);
+          edit_.AddFile2(level, i->meta.number, i->meta.file_size,
+                         i->meta.smallest, i->meta.largest,
+                         i->meta.exp_write_low, i->meta.exp_write_high, i->meta.exp_explicit_high);
 
       } // for
     } // for
@@ -451,7 +455,7 @@ class Repairer {
     {
       log::Writer log(file);
       std::string record;
-      edit_.EncodeTo(&record);
+      edit_.EncodeTo(&record);  // manifest format is default for release, options_ often incomplete
       status = log.AddRecord(record);
     }
     if (status.ok()) {

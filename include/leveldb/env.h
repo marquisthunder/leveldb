@@ -14,6 +14,7 @@
 #define STORAGE_LEVELDB_INCLUDE_ENV_H_
 
 #include <cstdarg>
+#include <pthread.h>
 #include <string>
 #include <vector>
 #include <stdint.h>
@@ -22,13 +23,14 @@
 
 namespace leveldb {
 
+class AppendableFile;
 class FileLock;
+struct Options;
 class Logger;
 class RandomAccessFile;
 class SequentialFile;
 class Slice;
 class WritableFile;
-class AppendableFile;
 
 class Env {
  public:
@@ -74,7 +76,8 @@ class Env {
   //
   // The returned file will only be accessed by one thread at a time.
   virtual Status NewWritableFile(const std::string& fname,
-                                 WritableFile** result) = 0;
+                                 WritableFile** result,
+                                 size_t map_size) = 0;
 
   // Riak specific:
   // Derived from NewWritableFile.  One change: if the file exists,
@@ -85,7 +88,8 @@ class Env {
   //
   // The returned file will only be accessed by one thread at a time.
   virtual Status NewAppendableFile(const std::string& fname,
-                                   WritableFile** result) = 0;
+                                   WritableFile** result,
+                                   size_t map_size) = 0;
 
   // Riak specific:
   // Allows for virtualized version of NewWritableFile that enables write
@@ -94,8 +98,9 @@ class Env {
   //
   // The returned file will only be accessed by one thread at a time.
   virtual Status NewWriteOnlyFile(const std::string& fname,
-                                   WritableFile** result)
-  {return(NewWritableFile(fname, result));};
+                                  WritableFile** result,
+                                  size_t map_size)
+  {return(NewWritableFile(fname, result, map_size));};
 
   // Returns true iff the named file exists.
   virtual bool FileExists(const std::string& fname) = 0;
@@ -173,11 +178,12 @@ class Env {
   // Sleep/delay the thread for the perscribed number of micro-seconds.
   virtual void SleepForMicroseconds(int micros) = 0;
 
-  // Riak specific:  Where supported, give count of background jobs pending.
-  virtual int GetBackgroundBacklog() const {return(0);};
-
   // Riak specific:  Get object that is tracking various software counters
   virtual PerformanceCounters * GetPerformanceCounters() {return(gPerfCounters);};
+
+  // Riak specific:  Request size of recovery memory map, potentially using
+  //  Options data for the decision.  Default 2Mbyte is Google's original size.
+  virtual size_t RecoveryMmapSize(const struct Options *) const {return(2*1024*1024L);};
 
  private:
   // No copying allowed
@@ -278,6 +284,12 @@ class Logger {
   Logger() { }
   virtual ~Logger();
 
+  // Riak specific function for hot backup.
+  //  hot_backup.cc assumes that it can rotate the LOG file
+  //  via standard Env routines if this function returns a
+  //  non-zero value.
+  virtual long LogSize() {return(0);};
+
   // Write an entry to the log file with the specified format.
   virtual void Logv(const char* format, va_list ap) = 0;
 
@@ -333,14 +345,14 @@ class EnvWrapper : public Env {
   Status NewRandomAccessFile(const std::string& f, RandomAccessFile** r) {
     return target_->NewRandomAccessFile(f, r);
   }
-  Status NewWritableFile(const std::string& f, WritableFile** r) {
-    return target_->NewWritableFile(f, r);
+  Status NewWritableFile(const std::string& f, WritableFile** r, size_t s=0) {
+    return target_->NewWritableFile(f, r, s);
   }
-  Status NewAppendableFile(const std::string& f, WritableFile** r) {
-    return target_->NewAppendableFile(f, r);
+  Status NewAppendableFile(const std::string& f, WritableFile** r, size_t s=0) {
+      return target_->NewAppendableFile(f, r, s);
   }
-  Status NewWriteOnlyFile(const std::string& f, WritableFile** r) {
-    return target_->NewWriteOnlyFile(f, r);
+  Status NewWriteOnlyFile(const std::string& f, WritableFile** r, size_t s=0) {
+    return target_->NewWriteOnlyFile(f, r, s);
   }
   bool FileExists(const std::string& f) { return target_->FileExists(f); }
   Status GetChildren(const std::string& dir, std::vector<std::string>* r) {

@@ -11,6 +11,12 @@
 #include <unistd.h>
 #include <assert.h>
 
+#if _POSIX_TIMERS >= 200801L
+   #include <time.h> // declares clock_gettime()
+#else
+   #include <sys/time.h> // declares gettimeofday()
+#endif
+
 #undef PLATFORM_IS_LITTLE_ENDIAN
 #if defined(OS_MACOSX)
   #include <machine/endian.h>
@@ -90,7 +96,7 @@ class CondVar;
 
 class Mutex {
  public:
-  Mutex();
+  Mutex(bool recursive=false); // true => creates a mutex that can be locked recursively
   ~Mutex();
 
   void Lock();
@@ -135,6 +141,11 @@ class CondVar {
   explicit CondVar(Mutex* mu);
   ~CondVar();
   void Wait();
+
+  // waits on the condition variable until the specified time is reached
+  bool // true => the condition variable was signaled, else timed out
+  Wait(struct timespec* pTimespec);
+
   void Signal();
   void SignalAll();
  private:
@@ -201,6 +212,46 @@ inline bool Snappy_Uncompress(const char* input, size_t length,
 inline bool GetHeapProfile(void (*func)(void*, const char*, int), void* arg) {
   return false;
 }
+
+// sets the name of the current thread
+inline void SetCurrentThreadName(const char* threadName) {
+  if (NULL == threadName) {
+    threadName = "";
+  }
+#if defined(OS_MACOSX)
+  pthread_setname_np(threadName);
+//#elif defined(OS_LINUX)
+#elif defined(__GLIBC__)
+#if  __GLIBC_PREREQ(2,12)
+  pthread_setname_np(pthread_self(), threadName);
+#endif
+#elif defined(OS_NETBSD)
+  pthread_setname_np(pthread_self(), threadName, NULL);
+#else
+  // we have some other platform(s) to support
+  //   defined(OS_FREEBSD) ... freebsd-9.2, Feb 19, 2016 not working
+  //
+  // NOTE: do not fail here since this functionality is optional
+#endif
+}
+
+// similar to Env::NowMicros except guaranteed to return "time" instead
+//  of potentially only ticks since reboot
+const uint64_t UINT64_ONE_SECOND_MICROS=1000000;
+
+inline uint64_t TimeMicros() {
+#if _POSIX_TIMERS >= 200801L
+    struct timespec ts;
+
+    // this is rumored to be faster than gettimeofday(),
+    clock_gettime(CLOCK_REALTIME, &ts);
+    return static_cast<uint64_t>(ts.tv_sec) * 1000000 + ts.tv_nsec/1000;
+#else
+    struct timeval tv;
+    gettimeofday(&tv, NULL);
+    return static_cast<uint64_t>(tv.tv_sec) * 1000000 + tv.tv_usec;
+#endif
+} // TimeMicros
 
 } // namespace port
 } // namespace leveldb

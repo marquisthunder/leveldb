@@ -7,6 +7,7 @@
 #include "db/filename.h"
 #include "db/dbformat.h"
 #include "leveldb/env.h"
+#include "leveldb/expiry.h"
 #include "leveldb/iterator.h"
 #include "leveldb/perf_count.h"
 #include "port/port.h"
@@ -48,14 +49,16 @@ class DBIter: public Iterator {
   };
 
   DBIter(const std::string* dbname, Env* env,
-         const Comparator* cmp, Iterator* iter, SequenceNumber s)
+         const Comparator* cmp, Iterator* iter, SequenceNumber s,
+         const ExpiryModule * expiry)
       : dbname_(dbname),
         env_(env),
         user_comparator_(cmp),
         iter_(iter),
         sequence_(s),
         direction_(kForward),
-        valid_(false) {
+        valid_(false),
+        expiry_(expiry) {
   }
   virtual ~DBIter() {
     gPerfCounters->Inc(ePerfIterDelete);
@@ -70,6 +73,26 @@ class DBIter: public Iterator {
     assert(valid_);
     return (direction_ == kForward) ? iter_->value() : saved_value_;
   }
+  // Riak specific:  if a database iterator, returns key meta data
+  // REQUIRES: Valid() and forward iteration
+  //  (reverse iteration is possible, just needs code)
+  virtual KeyMetaData & keymetadata() const
+  {
+    assert(valid_ && kForward==direction_);
+    if (kForward==direction_)
+    {
+      ParsedInternalKey parsed;
+      // this initialization clears a warning.  ParsedInternalKey says
+      //  it is not initializing for performance reasons ... oh well
+      parsed.type=kTypeValue; parsed.sequence=0; parsed.expiry=0;
+      ParseInternalKey(iter_->key(), &parsed);
+      keymetadata_.m_Type=parsed.type;
+      keymetadata_.m_Sequence=parsed.sequence;
+      keymetadata_.m_Expiry=parsed.expiry;
+    }
+    return(keymetadata_);
+  }
+
   virtual Status status() const {
     if (status_.ok()) {
       return iter_->status();
@@ -113,6 +136,7 @@ class DBIter: public Iterator {
   std::string saved_value_;   // == current raw value when direction_==kReverse
   Direction direction_;
   bool valid_;
+  const ExpiryModule * expiry_;
 
   // No copying allowed
   DBIter(const DBIter&);
@@ -162,6 +186,9 @@ void DBIter::FindNextUserEntry(bool skipping, std::string* skip) {
   do {
     ParsedInternalKey ikey;
     if (ParseKey(&ikey) && ikey.sequence <= sequence_) {
+      if (IsExpiryKey(ikey.type) && NULL!=expiry_
+          && expiry_->KeyRetirementCallback(ikey))
+        ikey.type=kTypeDeletion;
       switch (ikey.type) {
         case kTypeDeletion:
           // Arrange to skip all upcoming entries for this key since
@@ -169,6 +196,9 @@ void DBIter::FindNextUserEntry(bool skipping, std::string* skip) {
           SaveKey(ikey.user_key, skip);
           skipping = true;
           break;
+
+        case kTypeValueWriteTime:
+        case kTypeValueExplicitExpiry:
         case kTypeValue:
           if (skipping &&
               user_comparator_->Compare(ikey.user_key, *skip) <= 0) {
@@ -228,6 +258,10 @@ void DBIter::FindPrevUserEntry() {
           // We encountered a non-deleted value in entries for previous keys,
           break;
         }
+        if (IsExpiryKey(ikey.type) && NULL!=expiry_
+            && expiry_->KeyRetirementCallback(ikey))
+          ikey.type=kTypeDeletion;
+
         value_type = ikey.type;
         if (value_type == kTypeDeletion) {
           saved_key_.clear();
@@ -263,7 +297,7 @@ void DBIter::Seek(const Slice& target) {
   ClearSavedValue();
   saved_key_.clear();
   AppendInternalKey(
-      &saved_key_, ParsedInternalKey(target, sequence_, kValueTypeForSeek));
+      &saved_key_, ParsedInternalKey(target, 0, sequence_, kValueTypeForSeek));
   iter_->Seek(saved_key_);
   if (iter_->Valid()) {
     FindNextUserEntry(false, &saved_key_ /* temporary storage */);
@@ -299,8 +333,9 @@ Iterator* NewDBIterator(
     Env* env,
     const Comparator* user_key_comparator,
     Iterator* internal_iter,
-    const SequenceNumber& sequence) {
-  return new DBIter(dbname, env, user_key_comparator, internal_iter, sequence);
+    const SequenceNumber& sequence,
+    const ExpiryModule * expiry) {
+  return new DBIter(dbname, env, user_key_comparator, internal_iter, sequence, expiry);
 }
 
 }  // namespace leveldb

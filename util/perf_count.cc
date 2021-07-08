@@ -2,7 +2,7 @@
 //
 // perf_count.cc:  performance counters LevelDB
 //
-// Copyright (c) 2012-2013 Basho Technologies, Inc. All Rights Reserved.
+// Copyright (c) 2012-2016 Basho Technologies, Inc. All Rights Reserved.
 //
 // This file is provided to you under the Apache License,
 // Version 2.0 (the "License"); you may not use this file
@@ -34,6 +34,7 @@
 #include "leveldb/perf_count.h"
 #endif
 
+#include "leveldb/atomics.h"
 #include "util/coding.h"
 
 #define __STDC_FORMAT_MACROS
@@ -51,7 +52,6 @@ namespace leveldb
 //  need to test for "is shared object attached yet"
 static PerformanceCounters LocalStartupCounters;
 PerformanceCounters * gPerfCounters(&LocalStartupCounters);
-
 
     SstCounters::SstCounters()
         : m_IsReadOnly(false),
@@ -346,28 +346,25 @@ PerformanceCounters * gPerfCounters(&LocalStartupCounters);
         uint64_t ret_val;
 
         ret_val=0;
-        if (Index<m_CounterSize)
+        if (Index<m_CounterSize
+            && (!gPerfCountersDisabled || !m_PerfCounterAttr[Index].m_PerfDiscretionary))
         {
             volatile uint64_t * val_ptr;
 
             val_ptr=&m_Counter[Index];
 
 # if ULONG_MAX != 4294967295UL
-#ifdef OS_SOLARIS
-            atomic_inc_64(val_ptr);
-#else
-            __sync_add_and_fetch(val_ptr, 1);
-#endif
+            inc_and_fetch(val_ptr);
 #else
             // hack fest for 64 bit semi-atomic on 32bit machine
             uint32_t ret_32, * ptr_32;
 
             ptr_32=(uint32_t *)&val_ptr;
-            ret_32=__sync_add_and_fetch(ptr_32, 1);
+            ret_32=inc_and_fetch(ptr_32);
             if (0==ret_32)
             {
                 ++ptr_32;
-                __sync_add_and_fetch(ptr_32, 1);
+                inc_and_fetch(ptr_32);
             }   // if
 #endif
             ret_val=*val_ptr;
@@ -384,28 +381,25 @@ PerformanceCounters * gPerfCounters(&LocalStartupCounters);
         uint64_t ret_val;
 
         ret_val=0;
-        if (Index<m_CounterSize)
+        if (Index<m_CounterSize
+            && (!gPerfCountersDisabled || !m_PerfCounterAttr[Index].m_PerfDiscretionary))
         {
             volatile uint64_t * val_ptr;
 
             val_ptr=&m_Counter[Index];
 
 # if ULONG_MAX != 4294967295UL
-#ifdef OS_SOLARIS
-            atomic_dec_64(val_ptr);
-#else
-            __sync_sub_and_fetch(val_ptr, 1);
-#endif
+            dec_and_fetch(val_ptr);
 #else
             // hack fest for 64 bit semi-atomic on 32bit machine
             uint32_t ret_32, * ptr_32;
 
             ptr_32=(uint32_t *)&val_ptr;
-            ret_32=__sync_sub_and_fetch(ptr_32, 1);
+            ret_32=dec_and_fetch(ptr_32);
             if (0xFFFFFFFF==ret_32)
             {
                 ++ptr_32;
-                __sync_sub_and_fetch(ptr_32, 1);
+                dec_and_fetch(ptr_32);
             }   // if
 #endif
             ret_val=*val_ptr;
@@ -423,29 +417,26 @@ PerformanceCounters * gPerfCounters(&LocalStartupCounters);
         uint64_t ret_val;
 
         ret_val=0;
-        if (Index<m_CounterSize)
+        if (Index<m_CounterSize
+            && (!gPerfCountersDisabled || !m_PerfCounterAttr[Index].m_PerfDiscretionary))
         {
             volatile uint64_t * val_ptr;
 
             val_ptr=&m_Counter[Index];
 
 # if ULONG_MAX != 4294967295UL
-#ifdef OS_SOLARIS
-            ret_val=atomic_add_64_nv(val_ptr, Amount);
-#else
-            ret_val=__sync_add_and_fetch(val_ptr, Amount);
-#endif
+            ret_val=add_and_fetch(val_ptr, Amount);
 #else
             // hack fest for 64 bit semi-atomic on 32bit machine
             uint32_t old_32, ret_32, * ptr_32;
 
             ptr_32=(uint32_t *)&val_ptr;
             old_32=*ptr_32;
-            ret_32=__sync_add_and_fetch(ptr_32, Amount);
+            ret_32=add_and_fetch(ptr_32, (uint32_t)Amount);
             if (ret_32<old_32)
             {
                 ++ptr_32;
-                __sync_add_and_fetch(ptr_32, 1);
+                add_and_fetch(ptr_32, (uint32_t)1);
             }   // if
 
             ret_val=*val_ptr;
@@ -477,7 +468,8 @@ PerformanceCounters * gPerfCounters(&LocalStartupCounters);
         unsigned Index,
         uint64_t Amount)
     {
-        if (Index<m_CounterSize)
+        if (Index<m_CounterSize
+            && (!gPerfCountersDisabled || !m_PerfCounterAttr[Index].m_PerfDiscretionary))
         {
             volatile uint64_t * val_ptr;
 
@@ -513,7 +505,7 @@ PerformanceCounters * gPerfCounters(&LocalStartupCounters);
         const char * ret_ptr;
 
         if (Index<ePerfCountEnumSize)
-            ret_ptr=m_PerfCounterNames[Index];
+            ret_ptr=m_PerfCounterAttr[Index].m_PerfCounterName;
         else
             ret_ptr="???";
 
@@ -522,101 +514,115 @@ PerformanceCounters * gPerfCounters(&LocalStartupCounters);
     }   // PerformanceCounters::GetPtr
 
 
+
+    volatile bool gPerfCountersDisabled=true;
     int PerformanceCounters::m_PerfSharedId=-1;
     int PerformanceCounters::m_LastError=0;
     volatile uint64_t PerformanceCounters::m_BogusCounter=0;
-    const char * PerformanceCounters::m_PerfCounterNames[]=
+    const PerfCounterAttributes PerformanceCounters::m_PerfCounterAttr[]=
     {
-        "ROFileOpen",
-        "ROFileClose",
-        "ROFileUnmap",
-        "RWFileOpen",
-        "RWFileClose",
-        "RWFileUnmap",
-        "ApiOpen",
-        "ApiGet",
-        "ApiWrite",
-        "WriteSleep",
-        "WriteWaitImm",
-        "WriteWaitLevel0",
-        "WriteNewMem",
-        "WriteError",
-        "WriteNoWait",
-        "GetMem",
-        "GetImm",
-        "GetVersion",
-        "SearchLevel[0]",
-        "SearchLevel[1]",
-        "SearchLevel[2]",
-        "SearchLevel[3]",
-        "SearchLevel[4]",
-        "SearchLevel[5]",
-        "SearchLevel[6]",
-        "TableCached",
-        "TableOpened",
-        "TableGet",
-        "BGCloseUnmap",
-        "BGCompactImm",
-        "BGNormal",
-        "BGCompactLevel0",
-        "BlockFiltered",
-        "BlockFilterFalse",
-        "BlockCached",
-        "BlockRead",
-        "BlockFilterRead",
-        "BlockValidGet",
-        "Debug[0]",
-        "Debug[1]",
-        "Debug[2]",
-        "Debug[3]",
-        "Debug[4]",
-        "ReadBlockError",
-        "DBIterNew",
-        "DBIterNext",
-        "DBIterPrev",
-        "DBIterSeek",
-        "DBIterSeekFirst",
-        "DBIterSeekLast",
-        "DBIterDelete",
-        "eleveldbDirect",
-        "eleveldbQueued",
-        "eleveldbDequeued",
-        "elevelRefCreate",
-        "elevelRefDelete",
-        "ThrottleGauge",
-        "ThrottleCounter",
-        "ThrottleMicros0",
-        "ThrottleKeys0",
-        "ThrottleBacklog0",
-        "ThrottleCompacts0",
-        "ThrottleMicros1",
-        "ThrottleKeys1",
-        "ThrottleBacklog1",
-        "ThrottleCompacts1",
-        "BGWriteError",
-        "ThrottleWait",
-        "ThreadError",
-        "BGImmDirect",
-        "BGImmQueued",
-        "BGImmDequeued",
-        "BGImmWeighted",
-        "BGUnmapDirect",
-        "BGUnmapQueued",
-        "BGUnmapDequeued",
-        "BGUnmapWeighted",
-        "BGLevel0Direct",
-        "BGLevel0Queued",
-        "BGLevel0Dequeued",
-        "BGLevel0Weighted",
-        "BGCompactDirect",
-        "BGCompactQueued",
-        "BGCompactDequeued",
-        "BGCompactWeighted",
-        "FileCacheInsert",
-        "FileCacheRemove",
-        "BlockCacheInsert",
-        "BlockCacheRemove",
-        "ApiDelete"
+        {"ROFileOpen", true},
+        {"ROFileClose", true},
+        {"ROFileUnmap", true},
+        {"RWFileOpen", true},
+        {"RWFileClose", true},
+        {"RWFileUnmap", true},
+        {"ApiOpen", true},
+        {"ApiGet", true},
+        {"ApiWrite", true},
+        {"WriteSleep", true},
+        {"WriteWaitImm", false},
+        {"WriteWaitLevel0", false},
+        {"WriteNewMem", true},
+        {"WriteError", false},
+        {"WriteNoWait", true},
+        {"GetMem", true},
+        {"GetImm", true},
+        {"GetVersion", true},
+        {"SearchLevel[0]", true},
+        {"SearchLevel[1]", true},
+        {"SearchLevel[2]", true},
+        {"SearchLevel[3]", true},
+        {"SearchLevel[4]", true},
+        {"SearchLevel[5]", true},
+        {"SearchLevel[6]", true},
+        {"TableCached", true},
+        {"TableOpened", true},
+        {"TableGet", true},
+        {"BGCloseUnmap", true},
+        {"BGCompactImm", true},
+        {"BGNormal", true},
+        {"BGCompactLevel0", true},
+        {"BlockFiltered", true},
+        {"BlockFilterFalse", true},
+        {"BlockCached", true},
+        {"BlockRead", true},
+        {"BlockFilterRead", true},
+        {"BlockValidGet", true},
+        {"Debug[0]", true},
+        {"Debug[1]", true},
+        {"Debug[2]", true},
+        {"Debug[3]", true},
+        {"Debug[4]", true},
+        {"ReadBlockError", false},
+        {"DBIterNew", true},
+        {"DBIterNext", true},
+        {"DBIterPrev", true},
+        {"DBIterSeek", true},
+        {"DBIterSeekFirst", true},
+        {"DBIterSeekLast", true},
+        {"DBIterDelete", true},
+        {"eleveldbDirect", true},
+        {"eleveldbQueued", true},
+        {"eleveldbDequeued", true},
+        {"elevelRefCreate", true},
+        {"elevelRefDelete", true},
+        {"ThrottleGauge", true},
+        {"ThrottleCounter", true},
+        {"ThrottleMicros0", true},
+        {"ThrottleKeys0", true},
+        {"ThrottleBacklog0", true},
+        {"ThrottleCompacts0", true},
+        {"ThrottleMicros1", true},
+        {"ThrottleKeys1", true},
+        {"ThrottleBacklog1", true},
+        {"ThrottleCompacts1", true},
+        {"BGWriteError", false},
+        {"ThrottleWait", true},
+        {"ThreadError", false},
+        {"BGImmDirect", true},
+        {"BGImmQueued", true},
+        {"BGImmDequeued", true},
+        {"BGImmWeighted", true},
+        {"BGUnmapDirect", true},
+        {"BGUnmapQueued", true},
+        {"BGUnmapDequeued", true},
+        {"BGUnmapWeighted", true},
+        {"BGLevel0Direct", true},
+        {"BGLevel0Queued", true},
+        {"BGLevel0Dequeued", true},
+        {"BGLevel0Weighted", true},
+        {"BGCompactDirect", true},
+        {"BGCompactQueued", true},
+        {"BGCompactDequeued", true},
+        {"BGCompactWeighted", true},
+        {"FileCacheInsert", true},
+        {"FileCacheRemove", true},
+        {"BlockCacheInsert", true},
+        {"BlockCacheRemove", true},
+        {"ApiDelete", true},
+        {"BGMove", true},
+        {"BGMoveFail", false},
+        {"ThrottleUnadjusted", true},
+        {"eleveldbWeighted", true},
+        {"ExpiredKeys", true},
+        {"ExpiredFiles", true},
+        {"SyslogWrite", false},
+        {"BackupStarted", false},
+        {"BackupError", false},
+        {"PropCacheHit", true},
+        {"PropCacheMiss", true},
+        {"PropCacheError", false},
     };
 
 
@@ -632,7 +638,7 @@ PerformanceCounters * gPerfCounters(&LocalStartupCounters);
         {
             for (loop=0; loop<ePerfCountEnumSize && -1==index; ++loop)
             {
-                if (0==strcmp(m_PerfCounterNames[loop], Name))
+                if (0==strcmp(m_PerfCounterAttr[loop].m_PerfCounterName, Name))
                     index=loop;
             }   // loop
         }   // if
@@ -650,7 +656,8 @@ PerformanceCounters * gPerfCounters(&LocalStartupCounters);
 
         for (loop=0; loop<ePerfCountEnumSize; ++loop)
         {
-            printf("  %s: %" PRIu64 "\n", m_PerfCounterNames[loop], m_Counter[loop]);
+            printf("  %s: %" PRIu64 "\n",
+                   m_PerfCounterAttr[loop].m_PerfCounterName, m_Counter[loop]);
         }   // loop
     };  // Dump
 

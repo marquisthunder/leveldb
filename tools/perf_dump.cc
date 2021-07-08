@@ -4,6 +4,7 @@
 
 #include "leveldb/env.h"
 #include "leveldb/perf_count.h"
+#include "port/port.h"
 
 #define __STDC_FORMAT_MACROS
 #include <inttypes.h>
@@ -16,12 +17,13 @@ main(
     char ** argv)
 {
     bool error_seen, csv_header, diff_mode, running;
-    int counter, error_counter;
+    int error_counter;
     unsigned diff_seconds;
     char ** cursor;
 
     running=true;
     error_seen=false;
+    error_counter=0;
 
     csv_header=false;
     diff_mode=false;
@@ -63,7 +65,6 @@ main(
             running=false;
             error_counter=1;
             error_seen=true;
-
         }   // else
     }   // for
 
@@ -78,12 +79,10 @@ main(
 
         if (NULL!=perf_ptr)
         {
-            leveldb::Env * env;
             uint64_t first_time;
             int loop;
 
-            env=leveldb::Env::Default();
-            first_time=env->NowMicros();
+            first_time=leveldb::port::TimeMicros();
 
             if (csv_header)
             {
@@ -94,12 +93,12 @@ main(
             if (diff_mode)
             {
                 uint64_t prev_counters[leveldb::ePerfCountEnumSize], cur_counters[leveldb::ePerfCountEnumSize];
-                uint64_t prev_time, cur_time;
+                uint64_t cur_time;
 
                 do
                 {
                     // capture state before reporting
-                    cur_time=env->NowMicros();
+                    cur_time=leveldb::port::TimeMicros();
                     for (loop=0; loop<leveldb::ePerfCountEnumSize; ++loop)
                     {
                         cur_counters[loop]=perf_ptr->Value(loop);
@@ -109,7 +108,7 @@ main(
                     {
                         for (loop=0; loop<leveldb::ePerfCountEnumSize; ++loop)
                         {
-                            printf("%llu, %llu, %s, %" PRIu64 "\n",
+                            printf("%" PRIu64 ", %" PRIu64 ", %s, %" PRIu64 "\n",
                                    cur_time, cur_time-first_time,
                                    leveldb::PerformanceCounters::GetNamePtr(loop),
                                    cur_counters[loop]-prev_counters[loop]);
@@ -120,7 +119,6 @@ main(
 
                     // save for next pass
                     //  (counters are "live" so use data previously reported to maintain some consistency)
-                    prev_time=cur_time;
                     for (loop=0; loop<leveldb::ePerfCountEnumSize; ++loop)
                     {
                         prev_counters[loop]=cur_counters[loop];
@@ -135,7 +133,7 @@ main(
             {
                 for (loop=0; loop<leveldb::ePerfCountEnumSize; ++loop)
                 {
-                    printf("%llu, %u, %s, %" PRIu64 "\n",
+                    printf("%" PRIu64 ", %u, %s, %" PRIu64 "\n",
                            first_time, 0,
                            leveldb::PerformanceCounters::GetNamePtr(loop),
                            perf_ptr->Value(loop));

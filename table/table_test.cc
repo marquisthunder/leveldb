@@ -279,7 +279,7 @@ class KeyConvertingIterator: public Iterator {
   virtual ~KeyConvertingIterator() { delete iter_; }
   virtual bool Valid() const { return iter_->Valid(); }
   virtual void Seek(const Slice& target) {
-    ParsedInternalKey ikey(target, kMaxSequenceNumber, kTypeValue);
+    ParsedInternalKey ikey(target, 0, kMaxSequenceNumber, kTypeValue);
     std::string encoded;
     AppendInternalKey(&encoded, ikey);
     iter_->Seek(encoded);
@@ -739,7 +739,7 @@ TEST(MemTableTest, Simple) {
   batch.Put(std::string("k2"), std::string("v2"));
   batch.Put(std::string("k3"), std::string("v3"));
   batch.Put(std::string("largekey"), std::string("vlarge"));
-  ASSERT_TRUE(WriteBatchInternal::InsertInto(&batch, memtable).ok());
+  ASSERT_TRUE(WriteBatchInternal::InsertInto(&batch, memtable, NULL).ok());
 
   Iterator* iter = memtable->NewIterator();
   iter->SeekToFirst();

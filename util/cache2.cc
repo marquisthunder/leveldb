@@ -12,6 +12,8 @@
 #include <stdio.h>
 #include <stdlib.h>
 
+#include "db/table_cache.h"
+#include "db/version_edit.h"
 #include "leveldb/atomics.h"
 #include "leveldb/env.h"
 #include "util/cache2.h"
@@ -394,7 +396,7 @@ private:
 
           now=Env::Default()->NowMicros() / 1000000L;
 
-          SpinLock l(&id_spin_);  // release between shards to give access
+          SpinLock l(&id_spin_);
 
           for (loop=0; loop<kNumShards; ++loop)
           {
@@ -421,6 +423,32 @@ private:
 
   } // ShardedLRUCache2::PurgeExpiredFiles
 
+  // Walk all cache entries, calling functor Acc for each
+  bool
+  WalkCache(
+      CacheAccumulator & Acc)
+  {
+      int loop;
+      bool good(true);
+
+      SpinLock l(&id_spin_);
+
+      for (loop=0; loop<kNumShards && good; ++loop)
+      {
+          LRUHandle2 * cursor;
+
+          for (cursor=shard_[loop].LRUHead()->next;
+               cursor != shard_[loop].LRUHead() && good;
+               cursor=cursor->next)
+          {
+              good=Acc(cursor->value);
+          }   // for
+      }   // for
+
+      return(good);
+
+  } // ShardedLRUCache2::WalkCache
+
 };  //ShardedLRUCache2
 
 
@@ -432,14 +460,16 @@ DoubleCache::DoubleCache(
     : m_FileCache(NULL), m_BlockCache(NULL),
       m_IsInternalDB(options.is_internal_db), m_PlentySpace(true),
       m_Overhead(0), m_TotalAllocation(0),
-      m_FileTimeout(4*24*60*60),  // default is 4 days
+      m_FileTimeout(10*24*60*60),  // default is 10 days
       m_BlockCacheThreshold(options.block_cache_threshold),
       m_SizeCachedFiles(0)
 {
     // fixed allocation for recovery log and info LOG: 20M each
     //  (with 64 or open databases, this is a serious number)
     // and fixed allocation for two write buffers
-    m_Overhead=options.write_buffer_size*2 + gMapSize*2;
+
+    m_Overhead=options.write_buffer_size*2
+        + options.env->RecoveryMmapSize(&options) + 4096;
     m_TotalAllocation=gFlexCache.GetDBCacheCapacity(m_IsInternalDB);
 
     if (m_Overhead < m_TotalAllocation)
@@ -487,7 +517,8 @@ DoubleCache::ResizeCaches()
  */
 size_t
 DoubleCache::GetCapacity(
-    bool IsFileCache)
+    bool IsFileCache,
+    bool EstimatePageCache)
 {
     size_t  ret_val;
 
@@ -518,24 +549,27 @@ DoubleCache::GetCapacity(
                 //  file cache usage
                 ret_val=m_TotalAllocation - temp;
 
-                // if block cache allocation exceeds threshold,
-                //  give up some to page cache
-                if (m_BlockCacheThreshold < ret_val)
+                if (EstimatePageCache)
                 {
-                    uint32_t spare;
+                    // if block cache allocation exceeds threshold,
+                    //  give up some to page cache
+                    if (m_BlockCacheThreshold < ret_val)
+                    {
+                        uint32_t spare;
 
-                    spare=ret_val-m_BlockCacheThreshold;
+                        spare=ret_val-m_BlockCacheThreshold;
 
-                    // use m_SizeCachedFiles as approximation of page cache
-                    //  space needed for full files, i.e. prefer page cache to block cache
-                    //  (must use temp since m_SizeCachedFiles is volatile)
-                    temp = m_SizeCachedFiles;
-                    if (temp < spare)
-                        spare -= temp;
-                    else
-                        spare=0;
+                        // use m_SizeCachedFiles as approximation of page cache
+                        //  space needed for full files, i.e. prefer page cache to block cache
+                        //  (must use temp since m_SizeCachedFiles is volatile)
+                        temp = m_SizeCachedFiles;
+                        if (temp < spare)
+                            spare -= temp;
+                        else
+                            spare=0;
 
-                    ret_val=m_BlockCacheThreshold + spare;
+                        ret_val=m_BlockCacheThreshold + spare;
+                    }   // if
                 }   // if
 
                 // always allow for 2Mbyte minimum
@@ -598,7 +632,7 @@ Cache::Handle* LRUCache2::Lookup(const Slice& key, uint32_t hash) {
     LRU_Remove(e);
     LRU_Append(e);
 
-    // establish time limit on files in file cache (like 4 days)
+    // establish time limit on files in file cache (like 10 days)
     //  so they do not go stale and steal from block cache
     if (is_file_cache_)
     {
@@ -652,7 +686,7 @@ Cache::Handle* LRUCache2::Insert(
     e->expire_seconds=0;
     memcpy(e->key_data, key.data(), key.size());
 
-    // establish time limit on files in file cache (like 4 days)
+    // establish time limit on files in file cache (like 10 days)
     //  so they do not go stale and steal from block cache
     if (is_file_cache_)
     {

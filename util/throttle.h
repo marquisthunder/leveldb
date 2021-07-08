@@ -26,16 +26,22 @@
 namespace leveldb
 {
 
-extern pthread_rwlock_t gThreadLock0;
-extern pthread_rwlock_t gThreadLock1;
-
-
 void ThrottleInit();
 
-void SetThrottleWriteRate(uint64_t Micros, uint64_t Keys, bool IsLevel0, int Backlog);
+void SetThrottleWriteRate(uint64_t Micros, uint64_t Keys, bool IsLevel0);
 
 uint64_t GetThrottleWriteRate();
+uint64_t GetUnadjustedThrottleWriteRate();
 
-void ThrottleShutdown();
+// clock_gettime but only updated once every 60 seconds (roughly)
+//  (SetCachedTimeMicros() intended for unit tests)
+uint64_t GetCachedTimeMicros();
+void SetCachedTimeMicros(uint64_t);
+
+// step 1 in two step shutdown
+void ThrottleStopThreads();
+
+// step 2 in two step shutdown
+void ThrottleClose();
 
 }  // namespace leveldb

@@ -71,7 +71,8 @@ class DB {
   // Note: consider setting options.sync = true.
   virtual Status Put(const WriteOptions& options,
                      const Slice& key,
-                     const Slice& value) = 0;
+                     const Slice& value,
+                     const KeyMetaData * meta=NULL) = 0;
 
   // Remove the database entry (if any) for "key".  Returns OK on
   // success, and a non-OK status on error.  It is not an error if "key"
@@ -92,9 +93,11 @@ class DB {
   //
   // May return some other Status on an error.
   virtual Status Get(const ReadOptions& options,
-                     const Slice& key, std::string* value) = 0;
+                     const Slice& key, std::string* value,
+                     KeyMetaData * meta=NULL) = 0;
   virtual Status Get(const ReadOptions& options,
-                     const Slice& key, Value* value) = 0;
+                     const Slice& key, Value* value,
+                     KeyMetaData * meta=NULL) = 0;
 
   // Return a heap-allocated iterator over the contents of the database.
   // The result of NewIterator() is initially invalid (caller must
@@ -158,6 +161,15 @@ class DB {
   // compactions as necessary to correct.  Assumes DB opened
   // with Options.is_repair=true
   virtual Status VerifyLevels();
+
+  // Riak specific function:  Request database check for
+  // available compactions.  This is to stimulate retry of
+  // grooming that might have been offered and rejected previously
+  virtual void CheckAvailableCompactions();
+
+  // Riak specific function:  Give external code, namely
+  // eleveldb, access to leveldb's logging routines.
+  virtual Logger* GetLogger() const { return NULL; }
 
  private:
   // No copying allowed

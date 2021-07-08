@@ -37,6 +37,9 @@ struct Table::Rep {
   BlockHandle metaindex_handle;  // Handle to metaindex_block: saved from footer
   Block* index_block;
   SstCounters sst_counters;
+  BlockHandle filter_handle;
+  const FilterPolicy * filter_policy;
+  volatile uint32_t filter_flag;
 };
 
 Status Table::Open(const Options& options,
@@ -85,6 +88,8 @@ Status Table::Open(const Options& options,
     rep->filter_data = NULL;
     rep->filter_data_size = 0;
     rep->filter = NULL;
+    rep->filter_policy = NULL;
+    rep->filter_flag = 0;
     *table = new Table(rep);
     (*table)->ReadMeta(footer);
   } else {
@@ -95,14 +100,13 @@ Status Table::Open(const Options& options,
 }
 
 void Table::ReadMeta(const Footer& footer) {
-  if (rep_->options.filter_policy == NULL) {
-    return;  // Do not need any metadata
-  }
 
   // TODO(sanjay): Skip this if footer.metaindex_handle() size indicates
   // it is an empty block.
+  std::string key;
   ReadOptions opt;
   BlockContents contents;
+
   if (!ReadBlock(rep_->file, opt, footer.metaindex_handle(), &contents).ok()) {
     // Do not propagate errors since meta info is not needed for operation
     return;
@@ -111,46 +115,53 @@ void Table::ReadMeta(const Footer& footer) {
 
   Iterator* iter = meta->NewIterator(BytewiseComparator());
 
-  bool found,first;
-  const FilterPolicy * policy, * next;
-  std::string key;
+  // read filter only if policy set
+  if (NULL != rep_->options.filter_policy) {
+      bool found,first;
+      const FilterPolicy * policy, * next;
 
-  first=true;
-  next=NULL;
+      first=true;
+      next=NULL;
 
-  do
-  {
-      found=false;
-
-      if (first)
+      do
       {
-          policy=rep_->options.filter_policy;
-          next=FilterInventory::ListHead;
-          first=false;
-      }   // if
-      else
-      {
-          policy=next;
-          if (NULL!=policy)
-              next=policy->GetNext();
-          else
-              next=NULL;
-      }   // else
+          found=false;
 
-      if (NULL!=policy)
-      {
-          key = "filter.";
-          key.append(policy->Name());
-          iter->Seek(key);
-          if (iter->Valid() && iter->key() == Slice(key))
+          if (first)
           {
-              ReadFilter(iter->value(), policy);
-              gPerfCounters->Inc(ePerfBlockFilterRead);
-              found=true;
+              policy=rep_->options.filter_policy;
+              next=FilterInventory::ListHead;
+              first=false;
           }   // if
-      }   //if
-  } while(!found && NULL!=policy);
+          else
+          {
+              policy=next;
+              if (NULL!=policy)
+                  next=policy->GetNext();
+              else
+                  next=NULL;
+          }   // else
 
+          if (NULL!=policy)
+          {
+              key = "filter.";
+              key.append(policy->Name());
+              iter->Seek(key);
+              if (iter->Valid() && iter->key() == Slice(key))
+              {
+                  // store information needed to load bloom filter
+                  //  at a later time
+                  Slice v = iter->value();
+                  rep_->filter_handle.DecodeFrom(&v);
+                  rep_->filter_policy = policy;
+
+                  found=true;
+              }   // if
+          }   //if
+      } while(!found && NULL!=policy);
+  }   // if
+
+  // always read counters
   key="stats.sst1";
   iter->Seek(key);
   if (iter->Valid() && iter->key() == Slice(key)) {
@@ -161,17 +172,38 @@ void Table::ReadMeta(const Footer& footer) {
   delete meta;
 }
 
+
+// public version that reads filter at some time
+//  after open ... true if filter read
+bool
+Table::ReadFilter()
+{
+    bool ret_flag;
+
+    ret_flag=false;
+
+    if (0!=rep_->filter_handle.size()
+        && NULL!=rep_->filter_policy
+        && 1 == inc_and_fetch(&rep_->filter_flag))
+    {
+        gPerfCounters->Inc(ePerfBlockFilterRead);
+
+        ReadFilter(rep_->filter_handle, rep_->filter_policy);
+        ret_flag=(NULL != rep_->filter);
+
+        // only attempt the read once
+        rep_->filter_handle.set_size(0);
+    }   // if
+
+    return(ret_flag);
+}   // ReadFilter
+
+// Private version of ReadFilter that does the actual work
 void
 Table::ReadFilter(
-    const Slice& filter_handle_value,
+    BlockHandle & filter_handle,
     const FilterPolicy * policy)
 {
-  Slice v = filter_handle_value;
-  BlockHandle filter_handle;
-  if (!filter_handle.DecodeFrom(&v).ok()) {
-    return;
-  }
-
   // We might want to unify with ReadBlock() if we start
   // requiring checksum verification in Table::Open.
   ReadOptions opt;
@@ -370,7 +402,7 @@ uint64_t Table::ApproximateOffsetOf(const Slice& key) const {
 }
 
 
-uint64_t 
+uint64_t
 Table::GetFileSize()
 {
     return(rep_->file_size);

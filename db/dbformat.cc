@@ -3,6 +3,7 @@
 // found in the LICENSE file. See the AUTHORS file for names of contributors.
 
 #include <stdio.h>
+//#include "leveldb/expiry.h"
 #include "db/dbformat.h"
 #include "db/version_set.h"
 #include "port/port.h"
@@ -12,20 +13,29 @@ namespace leveldb {
 
 static uint64_t PackSequenceAndType(uint64_t seq, ValueType t) {
   assert(seq <= kMaxSequenceNumber);
-  assert(t <= kValueTypeForSeek);
+  // assert(t <= kValueTypeForSeek);  requires revisit once expiry live
+  assert(t <= kTypeValueExplicitExpiry);  // temp replacement for above
   return (seq << 8) | t;
 }
 
 void AppendInternalKey(std::string* result, const ParsedInternalKey& key) {
   result->append(key.user_key.data(), key.user_key.size());
+  if (IsExpiryKey(key.type))
+    PutFixed64(result, key.expiry);
   PutFixed64(result, PackSequenceAndType(key.sequence, key.type));
 }
 
 std::string ParsedInternalKey::DebugString() const {
   char buf[50];
-  snprintf(buf, sizeof(buf), "' @ %llu : %d",
-           (unsigned long long) sequence,
-           int(type));
+  if (IsExpiryKey(type))
+    snprintf(buf, sizeof(buf), "' @ %llu %llu : %d",
+             (unsigned long long) expiry,
+             (unsigned long long) sequence,
+             int(type));
+  else
+    snprintf(buf, sizeof(buf), "' @ %llu : %d",
+             (unsigned long long) sequence,
+             int(type));
   std::string result = "'";
   result += HexString(user_key.ToString());
   result += buf;
@@ -34,13 +44,33 @@ std::string ParsedInternalKey::DebugString() const {
 
 std::string ParsedInternalKey::DebugStringHex() const {
   char buf[50];
-  snprintf(buf, sizeof(buf), "' @ %llu : %d",
-           (unsigned long long) sequence,
-           int(type));
+  if (IsExpiryKey(type))
+    snprintf(buf, sizeof(buf), "' @ %llu %llu : %d",
+             (unsigned long long) expiry,
+             (unsigned long long) sequence,
+             int(type));
+  else
+    snprintf(buf, sizeof(buf), "' @ %llu : %d",
+             (unsigned long long) sequence,
+             int(type));
   std::string result = "'";
   result += HexString(user_key);
   result += buf;
   return result;
+}
+
+
+const char * KeyTypeString(ValueType val_type) {
+  const char * ret_ptr;
+  switch(val_type)
+  {
+      case kTypeDeletion: ret_ptr="kTypeDelete"; break;
+      case kTypeValue:    ret_ptr="kTypeValue"; break;
+      case kTypeValueWriteTime: ret_ptr="kTypeValueWriteTime"; break;
+      case kTypeValueExplicitExpiry: ret_ptr="kTypeValueExplicitExpiry"; break;
+      default: ret_ptr="(unknown ValueType)"; break;
+  }   // switch
+  return(ret_ptr);
 }
 
 std::string InternalKey::DebugString() const {
@@ -66,8 +96,10 @@ int InternalKeyComparator::Compare(const Slice& akey, const Slice& bkey) const {
   //    decreasing type (though sequence# should be enough to disambiguate)
   int r = user_comparator_->Compare(ExtractUserKey(akey), ExtractUserKey(bkey));
   if (r == 0) {
-    const uint64_t anum = DecodeFixed64(akey.data() + akey.size() - 8);
-    const uint64_t bnum = DecodeFixed64(bkey.data() + bkey.size() - 8);
+    uint64_t anum = DecodeFixed64(akey.data() + akey.size() - 8);
+    uint64_t bnum = DecodeFixed64(bkey.data() + bkey.size() - 8);
+    if (IsExpiryKey((ValueType)*(unsigned char *)&anum)) *(unsigned char*)&anum=(unsigned char)kTypeValue;
+    if (IsExpiryKey((ValueType)*(unsigned char *)&bnum)) *(unsigned char*)&bnum=(unsigned char)kTypeValue;
     if (anum > bnum) {
       r = -1;
     } else if (anum < bnum) {
@@ -130,7 +162,8 @@ bool InternalFilterPolicy::KeyMayMatch(const Slice& key, const Slice& f) const {
   return user_policy_->KeyMayMatch(ExtractUserKey(key), f);
 }
 
-LookupKey::LookupKey(const Slice& user_key, SequenceNumber s) {
+  LookupKey::LookupKey(const Slice& user_key, SequenceNumber s, KeyMetaData * meta) {
+  meta_=meta;
   size_t usize = user_key.size();
   size_t needed = usize + 13;  // A conservative estimate
   char* dst;
@@ -153,11 +186,12 @@ LookupKey::LookupKey(const Slice& user_key, SequenceNumber s) {
 KeyRetirement::KeyRetirement(
     const Comparator * Comparator,
     SequenceNumber SmallestSnapshot,
+    const Options * Opts,
     Compaction * const Compaction)
     : has_current_user_key(false), last_sequence_for_key(kMaxSequenceNumber),
       user_comparator(Comparator), smallest_snapshot(SmallestSnapshot),
-      compaction(Compaction),
-      valid(false)
+      options(Opts), compaction(Compaction),
+      valid(false), dropped(0), expired(0)
 {
     // NULL is ok for compaction
     valid=(NULL!=user_comparator);
@@ -166,12 +200,19 @@ KeyRetirement::KeyRetirement(
 }   // KeyRetirement::KeyRetirement
 
 
+KeyRetirement::~KeyRetirement()
+{
+    if (0!=expired)
+        gPerfCounters->Add(ePerfExpiredKeys, expired);
+}   // KeyRetirement::~KeyRetirement
+
+
 bool
 KeyRetirement::operator()(
     Slice & key)
 {
     ParsedInternalKey ikey;
-    bool drop = false;
+    bool drop = false, expire_flag;
 
     if (valid)
     {
@@ -200,20 +241,32 @@ KeyRetirement::operator()(
                 drop = true;    // (A)
             }   // if
 
-            else if (ikey.type == kTypeDeletion
-                     && ikey.sequence <= smallest_snapshot
-                     && NULL!=compaction  // mem to level0 ignores this test
-                     && compaction->IsBaseLevelForKey(ikey.user_key))
+            else
             {
-                // For this user key:
-                // (1) there is no data in higher levels
-                // (2) data in lower levels will have larger sequence numbers
-                // (3) data in layers that are being compacted here and have
-                //     smaller sequence numbers will be dropped in the next
-                //     few iterations of this loop (by rule (A) above).
-                // Therefore this deletion marker is obsolete and can be dropped.
-                drop = true;
-            }   // else if
+                expire_flag=false;
+                if (NULL!=options && options->ExpiryActivated())
+                    expire_flag=options->expiry_module->KeyRetirementCallback(ikey);
+
+                if ((ikey.type == kTypeDeletion || expire_flag)
+                    && ikey.sequence <= smallest_snapshot
+                    && NULL!=compaction  // mem to level0 ignores this test
+                    && compaction->IsBaseLevelForKey(ikey.user_key))
+                {
+                    // For this user key:
+                    // (1) there is no data in higher levels
+                    // (2) data in lower levels will have larger sequence numbers
+                    // (3) data in layers that are being compacted here and have
+                    //     smaller sequence numbers will be dropped in the next
+                    //     few iterations of this loop (by rule (A) above).
+                    // Therefore this deletion marker is obsolete and can be dropped.
+                    drop = true;
+
+                    if (expire_flag)
+                        ++expired;
+                    else
+                        ++dropped;
+                }   // if
+            }   // else
 
             last_sequence_for_key = ikey.sequence;
         }   // else

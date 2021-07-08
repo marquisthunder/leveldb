@@ -6,6 +6,7 @@
 #define STORAGE_LEVELDB_INCLUDE_OPTIONS_H_
 
 #include <stddef.h>
+#include <stdint.h>
 #include <string>
 #include <memory>
 
@@ -14,6 +15,7 @@ namespace leveldb {
 class Cache;
 class Comparator;
 class Env;
+class ExpiryModule;
 class FilterPolicy;
 class Logger;
 class Snapshot;
@@ -30,8 +32,33 @@ enum CompressionType {
   // NOTE: do not change the values of existing entries, as these are
   // part of the persistent format on disk.
   kNoCompression     = 0x0,
-  kSnappyCompression = 0x1
+  kSnappyCompression = 0x1,
+  kLZ4Compression    = 0x2,
+  kNoCompressionAutomated = 0x3
 };
+
+//  Originally located in db/dbformat.h.  Now available publically.
+// Value types encoded as the last component of internal keys.
+// DO NOT CHANGE THESE ENUM VALUES: they are embedded in the on-disk
+// data structures.
+enum ValueType {
+  kTypeDeletion = 0x0,
+  kTypeValue = 0x1,
+  kTypeValueWriteTime = 0x2,
+  kTypeValueExplicitExpiry = 0x3
+};
+
+//  Originally located in db/dbformat.h
+typedef uint64_t SequenceNumber;
+typedef uint64_t ExpiryTimeMicros;
+
+};  // namespace leveldb
+
+//
+// must follow ValueType declaration
+#include "leveldb/expiry.h"
+
+namespace leveldb {
 
 // Options to control the behavior of a database (passed to DB::Open)
 struct Options {
@@ -183,6 +210,9 @@ struct Options {
   // Default: false
   bool limited_developer_mem;
 
+  // The size of each MMAped file, choose 0 for the default (20M)
+  uint64_t mmap_size;
+
   // Riak option to adjust aggressive delete behavior.
   //  - zero disables aggressive delete
   //  - positive value indicates how many deletes must exist
@@ -214,10 +244,22 @@ struct Options {
   // array.  levels tiered_slow_level through 6 use this path prefix
   std::string tiered_slow_prefix;
 
+  // Riak specific option that writes a list of open table files
+  // to disk on close then automatically opens same files again
+  // upon restart.
+  bool cache_object_warming;
+
+  // Riak specific object that defines expiry policy for data
+  // written to leveldb.
+  ExpiryPtr_t expiry_module;
+
   // Create an Options object with default values for all fields.
   Options();
 
   void Dump(Logger * log) const;
+
+  bool ExpiryActivated() const
+        {return(NULL!=expiry_module.get() && expiry_module->ExpiryActivated());};
 
 private:
 
@@ -314,6 +356,22 @@ struct WriteOptions {
       : sync(false) {
   }
 };
+
+
+// Riak specific object that can return key metadata
+//  during get or iterate operation
+struct KeyMetaData
+{
+    ValueType m_Type;          // see above
+    SequenceNumber m_Sequence; // output only, leveldb internal
+    ExpiryTimeMicros m_Expiry; // microseconds since Epoch, UTC
+
+    KeyMetaData()
+    : m_Type(kTypeValue), m_Sequence(0), m_Expiry(0)
+    {};
+};  // struct KeyMetaData
+
+const char * CompileOptionsString();
 
 }  // namespace leveldb
 

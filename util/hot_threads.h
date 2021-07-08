@@ -2,7 +2,7 @@
 //
 // hot_threads.h
 //
-// Copyright (c) 2011-2013 Basho Technologies, Inc. All Rights Reserved.
+// Copyright (c) 2011-2015 Basho Technologies, Inc. All Rights Reserved.
 //
 // This file is provided to you under the Apache License,
 // Version 2.0 (the "License"); you may not use this file
@@ -54,14 +54,15 @@ public:
 
     volatile uint32_t m_Available;       //!< 1 if thread waiting, using standard type for atomic operation
     class HotThreadPool & m_Pool;        //!< parent pool object
-    volatile ThreadTask * m_DirectWork;    //!< work passed direct to thread
+    volatile ThreadTask * m_DirectWork;  //!< work passed direct to thread
+    int m_Nice;                          //!< amount to adjust sched priority
 
     port::Mutex m_Mutex;             //!< mutex for condition variable
     port::CondVar m_Condition;          //!< condition for thread waiting
 
 public:
-    HotThread(class HotThreadPool & Pool)
-    : m_Available(0), m_Pool(Pool), m_DirectWork(NULL),
+    HotThread(class HotThreadPool & Pool, int Nice)
+    : m_Available(0), m_Pool(Pool), m_DirectWork(NULL), m_Nice(Nice),
         m_Condition(&m_Mutex)
     {}   // HotThread
 
@@ -78,34 +79,6 @@ private:
 };  // class HotThread
 
 
-struct QueueThread
-{
-public:
-    bool m_ThreadGood;                   //!< true if thread and semaphore good
-    pthread_t m_ThreadId;                //!< handle for this thread
-    std::string m_QueueName;
-
-    class HotThreadPool & m_Pool;        //!< parent pool object
-
-    sem_t m_Semaphore;                   //!< counts items inserted to queue
-    sem_t * m_SemaphorePtr;              //!< either &m_Semaphore or sem_open return value
-
-public:
-    QueueThread(class HotThreadPool & Pool);
-
-    virtual ~QueueThread();
-
-    // actual work loop
-    void * QueueThreadRoutine();
-
-private:
-    QueueThread();                              // no default
-    QueueThread(const QueueThread &);             // no copy
-    QueueThread & operator=(const QueueThread&);  // no assign
-
-};  // class QueueThread
-
-
 class HotThreadPool
 {
 public:
@@ -120,7 +93,6 @@ public:
     WorkQueue_t   m_WorkQueue;
     port::Spin m_QueueLock;              //!< protects access to work_queue
     volatile size_t m_WorkQueueAtomic;   //!< atomic size to parallel work_queue.size().
-    QueueThread m_QueueThread;           //!< one slow response worker to cover edge case
 
     enum PerformanceCountersEnum m_DirectCounter;
     enum PerformanceCountersEnum m_QueuedCounter;
@@ -132,13 +104,14 @@ public:
                   enum PerformanceCountersEnum Direct,
                   enum PerformanceCountersEnum Queued,
                   enum PerformanceCountersEnum Dequeued,
-                  enum PerformanceCountersEnum Weighted);
+                  enum PerformanceCountersEnum Weighted,
+                  int Nice=0);
 
     virtual ~HotThreadPool();
 
     static void *ThreadStart(void *args);
 
-    bool FindWaitingThread(ThreadTask * work);
+    bool FindWaitingThread(ThreadTask * work, bool OkToQueue=true);
 
     bool Submit(ThreadTask * item, bool OkToQueue=true);
 

@@ -97,18 +97,21 @@ class Version {
   // largest_user_key==NULL represents a key largest than all keys in the DB.
   bool OverlapInLevel(int level,
                       const Slice* smallest_user_key,
-                      const Slice* largest_user_key);
+                      const Slice* largest_user_key) const;
 
   // Return the level at which we should place a new memtable compaction
   // result that covers the range [smallest_user_key,largest_user_key].
   int PickLevelForMemTableOutput(const Slice& smallest_user_key,
-                                 const Slice& largest_user_key);
+                                 const Slice& largest_user_key,
+                                 const int level_limit);
 
-  size_t NumFiles(int level) const { return files_[level].size(); }
+  virtual size_t NumFiles(int level) const { return files_[level].size(); }
+
+  const VersionSet * GetVersionSet() const { return vset_; }
 
   typedef std::vector<FileMetaData*> FileMetaDataVector_t;
 
-  const std::vector<FileMetaData*> & GetFileList(int level) const {return files_[level];};
+  virtual const std::vector<FileMetaData*> & GetFileList(int level) const {return files_[level];};
 
   volatile int WritePenalty() const {return write_penalty_; }
 
@@ -118,7 +121,7 @@ class Version {
   // Return a human readable string that describes this version's contents.
   std::string DebugString() const;
 
- private:
+protected:
   friend class Compaction;
   friend class VersionSet;
 
@@ -131,8 +134,9 @@ class Version {
   int refs_;                    // Number of live refs to this version
 
   // List of files per level
-  USED_BY_NESTED_FRIEND(std::vector<FileMetaData*> files_[config::kNumLevels])
+  USED_BY_NESTED_FRIEND(std::vector<FileMetaData*> files_[config::kNumLevels];)
 
+ protected:
   // Next file to compact based on seek stats (or Riak delete test)
   FileMetaData* file_to_compact_;
   int file_to_compact_level_;
@@ -143,20 +147,28 @@ class Version {
   double compaction_score_;
   int compaction_level_;
   bool compaction_grooming_;
+  bool compaction_no_move_;
+  bool compaction_expirefile_;
   volatile int write_penalty_;
 
+ protected:
+  // make the ctor/dtor protected, so that a unit test can subclass
   explicit Version(VersionSet* vset)
       : vset_(vset), next_(this), prev_(this), refs_(0),
         file_to_compact_(NULL),
         file_to_compact_level_(-1),
         compaction_score_(-1),
         compaction_level_(-1),
+        compaction_grooming_(false),
+        compaction_no_move_(false),
+        compaction_expirefile_(false),
         write_penalty_(0)
   {
   }
 
-  ~Version();
+  virtual ~Version();
 
+private:
   // No copying allowed
   Version(const Version&);
   void operator=(const Version&);
@@ -205,9 +217,11 @@ class VersionSet {
   size_t NumLevelFiles(int level) const;
 
   // is the specified level overlapped (or if false->sorted)
-  bool IsLevelOverlapped(int level) const;
+  static bool IsLevelOverlapped(int level);
 
-  uint64_t MaxFileSizeForLevel(int level) const;
+  static uint64_t DesiredBytesForLevel(int level);
+  static uint64_t MaxBytesForLevel(int level);
+  static uint64_t MaxFileSizeForLevel(int level);
 
   // Return the combined file size of all files at the specified level.
   int64_t NumLevelBytes(int level) const;
@@ -243,7 +257,11 @@ class VersionSet {
       if (0==penalty && 1!=throttle)
           ret_val=(int)throttle;
       else if (0!=penalty)
+      {
+          if (1==throttle)
+              throttle=GetUnadjustedThrottleWriteRate();
           ret_val=(int)penalty * throttle;
+      }   // else if
 
       return(ret_val);
   }
@@ -299,6 +317,8 @@ class VersionSet {
 
   TableCache* GetTableCache() {return(table_cache_);};
 
+  const Options * GetOptions() const {return(options_);};
+
   bool IsCompactionSubmitted(int level)
   {return(m_CompactionStatus[level].m_Submitted);}
 
@@ -308,11 +328,20 @@ class VersionSet {
   void SetCompactionRunning(int level)
   {m_CompactionStatus[level].m_Running=true;}
 
-  void SetCompactionDone(int level)
+  void SetCompactionDone(int level, uint64_t Now)
   {   m_CompactionStatus[level].m_Running=false;
-      m_CompactionStatus[level].m_Submitted=false;}
+      m_CompactionStatus[level].m_Submitted=false;
+      // must set both source and destination.  otherwise
+      //  destination might immediately decide it needs a
+      //  timed grooming too ... defeating idea to spreadout the groomings
+      m_CompactionStatus[level].m_LastCompaction=Now;
+      if ((level+1)<config::kNumLevels)
+          m_CompactionStatus[level+1].m_LastCompaction=Now;
+  }
 
- private:
+  bool NeighborCompactionsQuiet(int level);
+
+protected:
   class Builder;
 
   friend class Compaction;
@@ -347,7 +376,6 @@ class VersionSet {
   uint64_t last_sequence_;
   uint64_t log_number_;
   uint64_t prev_log_number_;  // 0 or backing store for memtable being compacted
-  uint64_t write_rate_usec_;   // most recent average rate per key
 
   // Opened lazily
   WritableFile* descriptor_file_;
@@ -363,21 +391,39 @@ class VersionSet {
   //  only one to write to manifest at a time.  Only used in LogAndApply
   port::Mutex manifest_mutex_;
 
+  volatile uint64_t last_penalty_minutes_;
+  volatile int prev_write_penalty_;
+
+
+
   struct CompactionStatus_s
   {
       bool m_Submitted;     //!< level submitted to hot thread pool
       bool m_Running;       //!< thread actually running compaction
+      uint64_t m_LastCompaction; //!<NowMicros() when last compaction completed
 
       CompactionStatus_s()
-      : m_Submitted(false), m_Running(false)
+      : m_Submitted(false), m_Running(false), m_LastCompaction(0)
       {};
   } m_CompactionStatus[config::kNumLevels];
 
-
+private:
   // No copying allowed
   VersionSet(const VersionSet&);
   void operator=(const VersionSet&);
 };
+
+//
+// allows routing of compaction request to
+//  diverse processing routines via common
+//  BackgroundCall2 thread entry
+//
+enum CompactionType
+{
+    kNormalCompaction = 0x0,
+    kExpiryFileCompaction = 0x1
+};  // CompactionType
+
 
 // A Compaction encapsulates information about a compaction.
 class Compaction {
@@ -387,6 +433,9 @@ class Compaction {
   // Return the level that is being compacted.  Inputs from "level"
   // and "level+1" will be merged to produce a set of "level+1" files.
   int level() const { return level_; }
+
+  // Return parent Version object
+  const Version * version() const { return input_version_; }
 
   // Return the object that holds the edits to the descriptor done
   // by this compaction.
@@ -428,6 +477,12 @@ class Compaction {
   size_t AverageValueSize()  const {return(avg_value_size_);};
   size_t AverageKeySize()    const {return(avg_key_size_);};
   size_t AverageBlockSize()  const {return(avg_block_size_);};
+  bool IsCompressible()      const {return(compressible_);};
+
+  // Riak specific:  is move operation ok for compaction?
+  bool IsMoveOk()            const {return(!no_move_);};
+
+  enum CompactionType GetCompactionType() const {return(compaction_type_);};
 
  private:
   friend class Version;
@@ -439,6 +494,7 @@ class Compaction {
   uint64_t max_output_file_size_;
   Version* input_version_;
   VersionEdit edit_;
+  CompactionType compaction_type_;
 
   // Each compaction reads inputs from "level_" and "level_+1"
   std::vector<FileMetaData*> inputs_[2];      // The two sets of inputs
@@ -465,7 +521,9 @@ class Compaction {
   size_t avg_value_size_;
   size_t avg_key_size_;
   size_t avg_block_size_;
+  bool compressible_;
   bool stats_done_;
+  bool no_move_;
 };
 
 }  // namespace leveldb
